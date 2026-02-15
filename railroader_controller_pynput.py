@@ -24,7 +24,7 @@ MAX_STEPS = 20  # Maximum steps for multi-step controls (throttle, brake, etc.)
 SERIAL_PORT = "COM3"  # Change to your Arduino's COM port
 SERIAL_BAUD = 9600  # Standard baud rate
 STARTUP_DELAY = 5  # Seconds to wait before starting (time to switch to Railroader)
-DEBUG_MODE = False  # Set to True to see every key press and value
+DEBUG_MODE = False  # Set to True to see detailed value debugging (very verbose!)
 LOG_KEYS = True  # Log each key press to console
 WINDOW_NAME = "Railroader"  # Partial name of Railroader window (case-insensitive)
 
@@ -56,8 +56,11 @@ def get_active_window_title():
 def is_railroader_focused():
     """Check if Railroader window is currently focused"""
     title = get_active_window_title()
+    if not title:
+        return False
     # Check if "Railroader" is in the window title (case-insensitive)
-    return WINDOW_NAME.lower() in title.lower() if title else False
+    is_focused = WINDOW_NAME.lower() in title.lower()
+    return is_focused
 
 # ============================================================================
 # DEBUG LOGGING
@@ -75,9 +78,11 @@ def log_key(key, action="PRESS", control=""):
 # KEYBOARD FUNCTIONS (PYNPUT)
 # ============================================================================
 
-def press_key(key):
-    """Press and release a key"""
+def press_key(key, hold_duration: float = 0):
+    """Press and release a key with optional hold duration"""
     keyboard.press(key)
+    if hold_duration > 0:
+        time.sleep(hold_duration)
     keyboard.release(key)
 
 def hold_key(key):
@@ -174,6 +179,7 @@ class ControlState:
     """Stores the previous state of all controls to avoid key spam"""
     def __init__(self):
         self.whistle_active = False
+        self.whistle_type: str | None = None  # 'low', 'high', or None
         self.headlight_zone = 2  # Start at middle zone
         self.cylinder_state = 0
         self.reverser_step = 0
@@ -305,27 +311,39 @@ def get_control_data(ser=None):
 def handle_whistle(whistle_value):
     """
     Whistle control: potentiometer with middle deadzone
-    Hold "v" when outside deadzone, release when inside
+    Below center → H (low pitch)
+    Above center → Shift+H (high pitch)
+    In deadzone → nothing
     
     Args:
         whistle_value: Analog value (0-1023)
     """
     # Apply deadzone around center (512)
     dz = deadzone(whistle_value, center=512, deadzone_range=50)
-    is_active = dz != 0
     
     if DEBUG_MODE:
-        print(f"WHISTLE: value={whistle_value}, deadzone_val={dz}, active={is_active}")
+        print(f"WHISTLE: value={whistle_value}, deadzone_val={dz}")
     
-    # Only send key events on state change
-    if is_active and not state.whistle_active:
-        hold_key('v')
-        log_key('v', "KEYDOWN", "WHISTLE")
-        state.whistle_active = True
-    elif not is_active and state.whistle_active:
-        release_key('v')
-        log_key('v', "KEYUP", "WHISTLE")
-        state.whistle_active = False
+    # Check which direction from center
+    if dz > 0:
+        # Above center - high pitch whistle (Shift+H)
+        if not state.whistle_active or state.whistle_type != 'high':
+            press_hotkey(Key.shift, 'h')
+            log_key('Shift+H', "PRESS", "WHISTLE HIGH")
+            state.whistle_active = True
+            state.whistle_type = 'high'
+    elif dz < 0:
+        # Below center - low pitch whistle (H)
+        if not state.whistle_active or state.whistle_type != 'low':
+            press_key('h')
+            log_key('H', "PRESS", "WHISTLE LOW")
+            state.whistle_active = True
+            state.whistle_type = 'low'
+    else:
+        # In deadzone - no whistle
+        if state.whistle_active:
+            state.whistle_active = False
+            state.whistle_type = None
 
 
 def handle_bell(bell_value):
@@ -405,13 +423,17 @@ def handle_reverser(reverser_value):
         # Left side - map to negative steps
         current_step = -map_to_steps(reverser_value, in_min=0, in_max=461, steps=MAX_STEPS)
     
+    if DEBUG_MODE:
+        print(f"REVERSER: value={reverser_value}, dz={dz}, step={current_step}, prev_step={state.reverser_step}")
+    
     # Emit keys when step increases (forward/backward direction changes)
+    # HOLD the key for 0.15s so the game registers it
     if current_step > state.reverser_step:
-        press_key('[')
-        log_key('[', "PRESS", "REVERSER FORWARD")
+        press_key('[', hold_duration=0.15)
+        log_key('[', "HELD", f"REVERSER FORWARD (step {current_step})")
     elif current_step < state.reverser_step:
-        press_key(']')
-        log_key(']', "PRESS", "REVERSER BACKWARD")
+        press_key(']', hold_duration=0.15)
+        log_key(']', "HELD", f"REVERSER BACKWARD (step {current_step})")
     
     state.reverser_step = current_step
 
@@ -427,12 +449,16 @@ def handle_throttle(throttle_value):
     """
     step = map_to_steps(throttle_value, steps=MAX_STEPS)
     
+    if DEBUG_MODE:
+        print(f"THROTTLE: value={throttle_value}, step={step}, prev_step={state.throttle_step}")
+    
+    # HOLD the key for 0.15s so the game registers the increment
     if step > state.throttle_step:
-        press_key('-')
-        log_key('-', "PRESS", f"THROTTLE UP (step {step})")
+        press_key('-', hold_duration=0.15)
+        log_key('-', "HELD", f"THROTTLE UP (step {step})")
     elif step < state.throttle_step:
-        press_key('=')
-        log_key('=', "PRESS", f"THROTTLE DOWN (step {step})")
+        press_key('=', hold_duration=0.15)
+        log_key('=', "HELD", f"THROTTLE DOWN (step {step})")
     
     state.throttle_step = step
 
@@ -448,12 +474,16 @@ def handle_train_brake(brake_value):
     """
     step = map_to_steps(brake_value, steps=MAX_STEPS)
     
+    if DEBUG_MODE:
+        print(f"TRAIN_BRAKE: value={brake_value}, step={step}, prev_step={state.train_brake_step}")
+    
+    # HOLD the key for 0.15s so the game registers the increment
     if step > state.train_brake_step:
-        press_key("'")
-        log_key("'", "PRESS", f"TRAIN BRAKE UP (step {step})")
+        press_key("'", hold_duration=0.15)
+        log_key("'", "HELD", f"TRAIN BRAKE UP (step {step})")
     elif step < state.train_brake_step:
-        press_key(';')
-        log_key(';', "PRESS", f"TRAIN BRAKE DOWN (step {step})")
+        press_key(';', hold_duration=0.15)
+        log_key(';', "HELD", f"TRAIN BRAKE DOWN (step {step})")
     
     state.train_brake_step = step
 
@@ -469,12 +499,16 @@ def handle_independent_brake(ind_brake_value):
     """
     step = map_to_steps(ind_brake_value, steps=MAX_STEPS)
     
+    if DEBUG_MODE:
+        print(f"IND_BRAKE: value={ind_brake_value}, step={step}, prev_step={state.ind_brake_step}")
+    
+    # HOLD the key for 0.15s so the game registers the increment
     if step > state.ind_brake_step:
-        press_key('.')
-        log_key('.', "PRESS", f"IND BRAKE UP (step {step})")
+        press_key('.', hold_duration=0.15)
+        log_key('.', "HELD", f"IND BRAKE UP (step {step})")
     elif step < state.ind_brake_step:
-        press_key(',')
-        log_key(',', "PRESS", f"IND BRAKE DOWN (step {step})")
+        press_key(',', hold_duration=0.15)
+        log_key(',', "HELD", f"IND BRAKE DOWN (step {step})")
     
     state.ind_brake_step = step
 
@@ -596,35 +630,26 @@ def main():
     print("-" * 70)
     print()
     
-    last_focus_state = False
-    focus_check_counter = 0
-    
     try:
         while True:
-            # Check window focus every 10 iterations (reduces overhead)
-            if focus_check_counter % 10 == 0:
-                currently_focused = is_railroader_focused()
-                
-                # Log focus changes
-                if currently_focused != last_focus_state:
-                    if currently_focused:
-                        print("\n>>> ✓ Railroader FOCUSED - Sending keys <<<\n")
-                    else:
-                        window_title = get_active_window_title()
-                        print(f"\n>>> ⚠ Railroader NOT focused - Keys PAUSED <<<")
-                        print(f">>> Current window: '{window_title}' <<<\n")
-                    last_focus_state = currently_focused
-            
-            focus_check_counter += 1
+            # CHECK WINDOW FOCUS EVERY SINGLE ITERATION (CRITICAL SAFETY!)
+            currently_focused = is_railroader_focused()
             
             # Only process controls if Railroader is focused
-            if last_focus_state:
+            if currently_focused:
                 # Read control data
                 data = get_control_data(ser)
                 
                 # Process controls
                 if data:
                     handle_controls(data)
+            else:
+                # Not focused - show warning occasionally
+                window_title = get_active_window_title()
+                if window_title:  # Only print if we got a title
+                    print(f"⚠ PAUSED - Railroader not focused (current: '{window_title[:50]}')  ", end='\r')
+                time.sleep(0.5)  # Longer delay when not focused
+                continue
             
             # Wait before next update
             time.sleep(UPDATE_INTERVAL)
@@ -635,13 +660,8 @@ def main():
         print("=" * 70)
     
     finally:
-        # Release any held keys (especially important for whistle!)
-        print("\nReleasing all held keys...")
-        try:
-            release_key('v')  # Whistle
-            print("  ✓ Whistle key released")
-        except:
-            pass
+        # Clean shutdown
+        print("\nShutting down...")
         
         # Close serial connection
         if ser is not None:
